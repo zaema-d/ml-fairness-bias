@@ -9,6 +9,7 @@ Reweighing mitigation).
 
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -25,17 +26,14 @@ models = {
 }
 
 
-def train_and_evaluate(dataset, model, protected_attr, scale=False, seed=42):
+def _fit_and_score(X_train, y_train_raw, test, model, protected_attr,
+                    fav_label, unfav_label, feature_names, scale=False):
     """
-    Train a single model on an AIF360 dataset and compute accuracy +
-    fairness metrics against a binary protected attribute.
-
-    Handles datasets whose favorable/unfavorable labels aren't already
-    coded as 0/1 (e.g. German Credit uses 1=good, 2=bad) — some models
-    (XGBoost in particular) require labels to be exactly 0 and 1.
+    Core fit/predict/evaluate step. Takes raw training arrays (not an
+    AIF360 dataset object) so callers can freely subset/mask the training
+    data with plain numpy — avoids AIF360's fragile `.subset()` method.
+    `test` must be a full AIF360 dataset object (needed for fairness metrics).
     """
-    train, test = dataset.split([0.7], shuffle=True, seed=seed)
-    X_train, y_train_raw = train.features, train.labels.ravel()
     X_test, y_test_raw = test.features, test.labels.ravel()
 
     if scale:
@@ -43,21 +41,13 @@ def train_and_evaluate(dataset, model, protected_attr, scale=False, seed=42):
         X_train = scaler.fit_transform(X_train)
         X_test = scaler.transform(X_test)
 
-    # --- label remapping (fixes non-0/1 label coding) ---
-    fav_label = dataset.favorable_label
-    unfav_label = dataset.unfavorable_label
-
     y_train = np.where(y_train_raw == fav_label, 1, 0)
     y_test = np.where(y_test_raw == fav_label, 1, 0)
 
     model.fit(X_train, y_train)
-    preds = model.predict(X_test)  # 0/1
+    preds = model.predict(X_test)
 
-    # map predictions back to the dataset's native label coding so
-    # AIF360's ClassificationMetric (which reads favorable_label off
-    # the dataset objects) stays consistent
     preds_native = np.where(preds == 1, fav_label, unfav_label)
-
     test_pred = test.copy()
     test_pred.labels = preds_native.reshape(-1, 1)
 
@@ -70,33 +60,42 @@ def train_and_evaluate(dataset, model, protected_attr, scale=False, seed=42):
     importances = None
     if hasattr(model, 'feature_importances_'):
         importances = pd.Series(
-            model.feature_importances_, index=train.feature_names
+            model.feature_importances_, index=feature_names
         ).sort_values(key=abs, ascending=False)
     elif hasattr(model, 'coef_'):
         importances = pd.Series(
-            model.coef_[0], index=train.feature_names
+            model.coef_[0], index=feature_names
         ).sort_values(key=abs, ascending=False)
 
     metrics = {
         'accuracy': (preds == y_test).mean(),
-        # Did both groups receive positive predictions at the same rate?
         'stat_parity_diff': metric.statistical_parity_difference(),
-        # Among people who truly deserved a positive prediction, did both groups have the same chance of getting one?
         'equal_opp_diff': metric.equal_opportunity_difference(),
-        # Same idea as statistical parity, but as a ratio instead of a difference
         'disparate_impact': metric.disparate_impact(),
-        # Compares both false positive and true positive rate gaps — a stricter, two-sided check
         'equalized_odds_diff': metric.average_odds_difference()
     }
 
     return metrics, importances
 
 
+def train_and_evaluate(dataset, model, protected_attr, scale=False, seed=42):
+    """
+    Baseline: split dataset 70/30, train one model, evaluate on the test set.
+    """
+    train, test = dataset.split([0.7], shuffle=True, seed=seed)
+    X_train, y_train_raw = train.features, train.labels.ravel()
+
+    return _fit_and_score(
+        X_train, y_train_raw, test, model, protected_attr,
+        fav_label=test.favorable_label, unfav_label=test.unfavorable_label,
+        feature_names=train.feature_names, scale=scale
+    )
+
+
 def run_all_models(dataset, protected_attr, models_dict=None, seed=42):
     """
-    Convenience wrapper: runs train_and_evaluate for every model in
-    models_dict (defaults to the module-level `models`), returns a
-    results DataFrame plus a dict of feature-importance Series.
+    Baseline: runs train_and_evaluate for every model, returns a results
+    DataFrame plus a dict of feature-importance Series.
     """
     if models_dict is None:
         models_dict = models
@@ -116,3 +115,66 @@ def run_all_models(dataset, protected_attr, models_dict=None, seed=42):
 
     results_df = pd.DataFrame(results_table).set_index('model')
     return results_df, importance_dict
+
+
+def run_subset_experiment(dataset, protected_attr, models_dict=None, seed=42):
+    """
+    The 3-subset experimental design: train on privileged-only,
+    unprivileged-only, and combined data, then evaluate all three against
+    the SAME held-out test set. Runs every model in models_dict on each
+    of the 3 training subsets.
+
+    Uses plain numpy boolean masking to build the subsets (rather than
+    AIF360's `.subset()`, which can throw IndexError when instance_names
+    don't line up cleanly after a split).
+
+    Returns
+    -------
+    results_df : pd.DataFrame
+        MultiIndex (training_subset, model), one row per combination.
+    """
+    if models_dict is None:
+        models_dict = models
+
+    train, test = dataset.split([0.7], shuffle=True, seed=seed)
+
+    X_train_full = train.features
+    y_train_full_raw = train.labels.ravel()
+
+    # train.protected_attributes has one column per protected attribute
+    # (German Credit has both 'sex' and 'age') — select the right one by
+    # name rather than raveling the whole 2D array.
+    attr_col = train.protected_attribute_names.index(protected_attr)
+    protected_vals = train.protected_attributes[:, attr_col]
+
+    fav_label = test.favorable_label
+    unfav_label = test.unfavorable_label
+    feature_names = train.feature_names
+
+    priv_mask = protected_vals == 1
+    unpriv_mask = protected_vals == 0
+
+    subsets = {
+        'privileged_only': (X_train_full[priv_mask], y_train_full_raw[priv_mask]),
+        'unprivileged_only': (X_train_full[unpriv_mask], y_train_full_raw[unpriv_mask]),
+        'combined': (X_train_full, y_train_full_raw)
+    }
+
+    results_table = []
+
+    for subset_name, (X_sub, y_sub_raw) in subsets.items():
+        for model_name, model in models_dict.items():
+            model_instance = clone(model)  # fresh, unfitted copy each time
+            scale = (model_name == 'Logistic Regression')
+
+            metrics, _ = _fit_and_score(
+                X_sub, y_sub_raw, test, model_instance, protected_attr,
+                fav_label=fav_label, unfav_label=unfav_label,
+                feature_names=feature_names, scale=scale
+            )
+            metrics['training_subset'] = subset_name
+            metrics['model'] = model_name
+            results_table.append(metrics)
+
+    results_df = pd.DataFrame(results_table).set_index(['training_subset', 'model'])
+    return results_df
