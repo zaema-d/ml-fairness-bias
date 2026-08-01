@@ -9,3 +9,8 @@ data/*
 
 # macOS
 .DS_Store
+
+# Folktables/dataset caches (large, regenerable — never commit)
+**/data/*.csv
+**/data/**/*.csv
+notebooks/data/
