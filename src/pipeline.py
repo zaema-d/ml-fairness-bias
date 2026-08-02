@@ -16,6 +16,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 from aif360.metrics import ClassificationMetric
+from aif360.algorithms.preprocessing import Reweighing
 
 
 models = {
@@ -27,12 +28,13 @@ models = {
 
 
 def _fit_and_score(X_train, y_train_raw, test, model, protected_attr,
-                    fav_label, unfav_label, feature_names, scale=False):
+                    fav_label, unfav_label, feature_names, scale=False,
+                    sample_weight=None):
     """
     Core fit/predict/evaluate step. Takes raw training arrays (not an
-    AIF360 dataset object) so callers can freely subset/mask the training
-    data with plain numpy — avoids AIF360's fragile `.subset()` method.
-    `test` must be a full AIF360 dataset object (needed for fairness metrics).
+    AIF360 dataset object) so callers can freely subset/mask/reweight the
+    training data. `test` must be a full AIF360 dataset object (needed
+    for fairness metrics).
     """
     X_test, y_test_raw = test.features, test.labels.ravel()
 
@@ -44,7 +46,10 @@ def _fit_and_score(X_train, y_train_raw, test, model, protected_attr,
     y_train = np.where(y_train_raw == fav_label, 1, 0)
     y_test = np.where(y_test_raw == fav_label, 1, 0)
 
-    model.fit(X_train, y_train)
+    if sample_weight is not None:
+        model.fit(X_train, y_train, sample_weight=sample_weight)
+    else:
+        model.fit(X_train, y_train)
     preds = model.predict(X_test)
 
     preds_native = np.where(preds == 1, fav_label, unfav_label)
@@ -177,4 +182,57 @@ def run_subset_experiment(dataset, protected_attr, models_dict=None, seed=42):
             results_table.append(metrics)
 
     results_df = pd.DataFrame(results_table).set_index(['training_subset', 'model'])
+    return results_df
+
+
+def run_reweighing_experiment(dataset, protected_attr, models_dict=None, seed=42):
+    """
+    Reweighing mitigation case study: apply AIF360's Reweighing
+    pre-processing algorithm to the training set (computes per-instance
+    weights that upweight underrepresented protected-group/outcome
+    combinations), then train each model with those weights and evaluate
+    on the same held-out test set used elsewhere.
+
+    Returns
+    -------
+    results_df : pd.DataFrame
+        One row per model (post-Reweighing results). Compare directly
+        against the 'combined' rows of run_subset_experiment (or
+        run_all_models) on the same dataset for the pre-mitigation baseline.
+    """
+    if models_dict is None:
+        models_dict = models
+
+    train, test = dataset.split([0.7], shuffle=True, seed=seed)
+
+    rw = Reweighing(
+        unprivileged_groups=[{protected_attr: 0}],
+        privileged_groups=[{protected_attr: 1}]
+    )
+    train_rw = rw.fit_transform(train)
+
+    X_train = train_rw.features
+    y_train_raw = train_rw.labels.ravel()
+    sample_weight = train_rw.instance_weights
+
+    fav_label = test.favorable_label
+    unfav_label = test.unfavorable_label
+    feature_names = train_rw.feature_names
+
+    results_table = []
+
+    for model_name, model in models_dict.items():
+        model_instance = clone(model)
+        scale = (model_name == 'Logistic Regression')
+
+        metrics, _ = _fit_and_score(
+            X_train, y_train_raw, test, model_instance, protected_attr,
+            fav_label=fav_label, unfav_label=unfav_label,
+            feature_names=feature_names, scale=scale,
+            sample_weight=sample_weight
+        )
+        metrics['model'] = model_name
+        results_table.append(metrics)
+
+    results_df = pd.DataFrame(results_table).set_index('model')
     return results_df
