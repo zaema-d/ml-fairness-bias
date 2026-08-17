@@ -1,0 +1,4 @@
+dataset,n,protected attribute(s),label,favourable outcome,unfavourable outcome,source
+German Credit,1000,"sex (1.0=Male, 0.0=Female); age (1.0=Old, 0.0=Young)",credit,1.0 = Good Credit,2.0 = Bad Credit,"AIF360 built-in (GermanDataset), UCI Statlog German Credit"
+Taiwan Credit Default,30000,"SEX (1.0=male (privileged), 0.0=female (unprivileged))",default,0.0 = did not default (favourable),1.0 = defaulted (unfavourable),"UCI ML Repository, ID 350"
+Folktables ACS Employment,378817,"SEX (1.0=male (privileged), 0.0=female (unprivileged))",employed,1.0 = employed (favourable),0.0 = not employed (unfavourable),"US Census ACS PUMS (2018, CA, 1-Year) via folktables package"
