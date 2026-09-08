@@ -13,8 +13,9 @@ def load_taiwan():
     taiwan = fetch_ucirepo(id=350)
     df = taiwan.data.features.copy()
 
-    # UCI ships this dataset with anonymized column names (X1-X23).
-    # Renaming to the documented meanings for readability.
+    # The raw UCI file uses generic names like X1, X2, ..., X23.
+    # Rename them to meaningful column names so the dataset is easier to read
+    # and easier to interpret later in the fairness pipeline.
     df = df.rename(columns={
         'X1': 'LIMIT_BAL', 'X2': 'SEX', 'X3': 'EDUCATION', 'X4': 'MARRIAGE',
         'X5': 'AGE', 'X6': 'PAY_0', 'X7': 'PAY_2', 'X8': 'PAY_3',
@@ -24,12 +25,16 @@ def load_taiwan():
         'X18': 'PAY_AMT1', 'X19': 'PAY_AMT2', 'X20': 'PAY_AMT3',
         'X21': 'PAY_AMT4', 'X22': 'PAY_AMT5', 'X23': 'PAY_AMT6',
     })
+    # Add the target variable.
+    # 0 = no default, 1 = default.
     df['default'] = np.asarray(taiwan.data.targets).astype(int).ravel()
 
-    # Raw SEX coding is 1=male, 2=female. Remap to 1=privileged, 0=unprivileged
-    # so it matches the 0/1 convention pipeline.py assumes for every dataset.
+    
+    # Original UCI codes use 1 = male, 2 = female.
+    # Convert to the 0/1 protected-attribute format used by AIF360:
+    # 1 = privileged (male), 0 = unprivileged (female).
+   
     df['SEX'] = df['SEX'].map({1: 1, 2: 0})
-
     return StandardDataset(
         df=df,
         label_name='default',
@@ -38,19 +43,20 @@ def load_taiwan():
         privileged_classes=[[1]]      # 1 = male (privileged)
     )
 
-
+    
 def load_folktables(state="CA", year="2018"):
     data_source = ACSDataSource(survey_year=year, horizon='1-Year', survey='person')
     acs_data = data_source.get_data(states=[state], download=True)
     features, label, group = ACSEmployment.df_to_pandas(acs_data)
 
     df = features.copy()
-    # label comes back as a DataFrame with its own index — assign by
-    # position (numpy array) to avoid silent index-misalignment NaNs
+    # The label is returned as a separate array.
+    # We attach it to the dataframe so the data is in one table for training.
     df['employed'] = np.asarray(label).astype(int).ravel()
 
-    # Raw SEX coding is 1=male, 2=female. Remap to 1=privileged, 0=unprivileged
-    # so it matches the 0/1 convention pipeline.py assumes for every dataset.
+    # UCI-style coding: 1 = male, 2 = female.
+    # Convert to the same 1/0 convention used across the project:
+    # 1 = privileged, 0 = unprivileged.
     df['SEX'] = df['SEX'].map({1: 1, 2: 0})
 
     return StandardDataset(

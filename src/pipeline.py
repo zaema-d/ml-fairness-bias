@@ -1,7 +1,7 @@
 """
 src/pipeline.py
 
-Reusable training + fairness evaluation pipeline for the thesis.
+Reusable training + fairness evaluation pipeline
 Used across all datasets (German Credit, Taiwan Credit Default, Folktables
 ACS Employment) and all experiment stages (baseline, 3-subset design,
 Reweighing mitigation).
@@ -30,18 +30,22 @@ models = {
 def _fit_and_score(X_train, y_train_raw, test, model, protected_attr,
                     fav_label, unfav_label, feature_names, scale=False,
                     sample_weight=None):
-    """
-    Core fit/predict/evaluate step. Takes raw training arrays (not an
-    AIF360 dataset object) so callers can freely subset/mask/reweight the
-    training data. `test` must be a full AIF360 dataset object (needed
-    for fairness metrics).
-    """
+    
+    # Train one model and evaluate it on a held-out test set.
+    # This helper works with raw arrays instead of a full AIF360 dataset,
+    # which makes it easier to create subsets, masks, or reweighted samples.
+    # The test set stays as a full AIF360 dataset because fairness metrics need
+    # the original protected-attribute structure.
+
     X_test, y_test_raw = test.features, test.labels.ravel()
 
     if scale:
         scaler = StandardScaler()
         X_train = scaler.fit_transform(X_train)
         X_test = scaler.transform(X_test)
+
+    # Convert labels to a simple 0/1 format for sklearn.
+    # 1 means the favorable outcome, 0 means the unfavorable one.
 
     y_train = np.where(y_train_raw == fav_label, 1, 0)
     y_test = np.where(y_test_raw == fav_label, 1, 0)
@@ -51,6 +55,9 @@ def _fit_and_score(X_train, y_train_raw, test, model, protected_attr,
     else:
         model.fit(X_train, y_train)
     preds = model.predict(X_test)
+
+    # Convert predictions back to the dataset's original label encoding
+    # so AIF360 can evaluate fairness correctly.
 
     preds_native = np.where(preds == 1, fav_label, unfav_label)
     test_pred = test.copy()
@@ -84,9 +91,9 @@ def _fit_and_score(X_train, y_train_raw, test, model, protected_attr,
 
 
 def train_and_evaluate(dataset, model, protected_attr, scale=False, seed=42):
-    """
-    Baseline: split dataset 70/30, train one model, evaluate on the test set.
-    """
+
+    # Train one model on a 70/30 split and evaluate it on the held-out test set.
+
     train, test = dataset.split([0.7], shuffle=True, seed=seed)
     X_train, y_train_raw = train.features, train.labels.ravel()
 
@@ -98,10 +105,10 @@ def train_and_evaluate(dataset, model, protected_attr, scale=False, seed=42):
 
 
 def run_all_models(dataset, protected_attr, models_dict=None, seed=42):
-    """
-    Baseline: runs train_and_evaluate for every model, returns a results
-    DataFrame plus a dict of feature-importance Series.
-    """
+
+    # Run every model in the model dictionary on the same dataset
+    # and return one results table plus feature importance for each model.
+  
     if models_dict is None:
         models_dict = models
 
@@ -123,21 +130,14 @@ def run_all_models(dataset, protected_attr, models_dict=None, seed=42):
 
 
 def run_subset_experiment(dataset, protected_attr, models_dict=None, seed=42):
-    """
-    The 3-subset experimental design: train on privileged-only,
-    unprivileged-only, and combined data, then evaluate all three against
-    the SAME held-out test set. Runs every model in models_dict on each
-    of the 3 training subsets.
 
-    Uses plain numpy boolean masking to build the subsets (rather than
-    AIF360's `.subset()`, which can throw IndexError when instance_names
-    don't line up cleanly after a split).
+    # Compare three training setups:
+    # 1) privileged-only
+    # 2) unprivileged-only
+    # 3) combined data
 
-    Returns
-    -------
-    results_df : pd.DataFrame
-        MultiIndex (training_subset, model), one row per combination.
-    """
+    # All three are evaluated on the same test set.
+
     if models_dict is None:
         models_dict = models
 
@@ -146,11 +146,13 @@ def run_subset_experiment(dataset, protected_attr, models_dict=None, seed=42):
     X_train_full = train.features
     y_train_full_raw = train.labels.ravel()
 
-    # train.protected_attributes has one column per protected attribute
-    # (German Credit has both 'sex' and 'age') — select the right one by
-    # name rather than raveling the whole 2D array.
+    # Pick the correct protected-attribute column by name.
+    # This matters because some datasets have more than one protected feature.
     attr_col = train.protected_attribute_names.index(protected_attr)
     protected_vals = train.protected_attributes[:, attr_col]
+
+    # Create clean subsets using boolean masks.
+    # This is simpler and more reliable than using AIF360 subset logic here.
 
     fav_label = test.favorable_label
     unfav_label = test.unfavorable_label
@@ -187,18 +189,9 @@ def run_subset_experiment(dataset, protected_attr, models_dict=None, seed=42):
 
 def run_reweighing_experiment(dataset, protected_attr, models_dict=None, seed=42):
     """
-    Reweighing mitigation case study: apply AIF360's Reweighing
-    pre-processing algorithm to the training set (computes per-instance
-    weights that upweight underrepresented protected-group/outcome
-    combinations), then train each model with those weights and evaluate
-    on the same held-out test set used elsewhere.
-
-    Returns
-    -------
-    results_df : pd.DataFrame
-        One row per model (post-Reweighing results). Compare directly
-        against the 'combined' rows of run_subset_experiment (or
-        run_all_models) on the same dataset for the pre-mitigation baseline.
+    Apply AIF360's Reweighing method to the training data so
+    the model learns from a more balanced distribution.
+    Then evaluate each model on the same held-out test set.
     """
     if models_dict is None:
         models_dict = models
